@@ -2202,6 +2202,78 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
         });
       });
 
+      // xterm.js 6's viewport renders via an internal VS Code-style
+      // "scrollable element" that repositions its content with JS
+      // (mouse wheel + scrollbar drag) instead of relying on the browser's
+      // native `overflow` scrolling. Because the scrollable element's DOM
+      // node is never actually taller than its container, a single-finger
+      // touchmove has nothing to natively scroll and is swallowed - the
+      // terminal appears frozen on mobile. Two-finger swipes "work" only
+      // because some mobile browsers synthesize wheel events for that
+      // gesture, which xterm's wheel handling already supports.
+      // Bridge single-finger touch drags into xterm's own scrollLines()
+      // API so the content actually moves. This only listens for
+      // TouchEvents, so desktop mouse-drag text selection (handled
+      // entirely by xterm's SelectionService via mousedown/mousemove) is
+      // untouched.
+      //
+      // Note: listeners are attached to the outer container rather than
+      // `.xterm-viewport` - the `.xterm-screen` layer (which owns the
+      // rendered text canvases) is stacked on top of `.xterm-viewport` in
+      // the DOM and captures all pointer/touch hit-testing, so a listener
+      // on `.xterm-viewport` itself would never fire.
+      const touchScrollTarget = xtermRef.current;
+      let touchScrollLastY: number | null = null;
+      let touchScrollRemainderPx = 0;
+      const handleTouchStart = (e: TouchEvent) => {
+        if (e.touches.length !== 1) {
+          touchScrollLastY = null;
+          touchScrollRemainderPx = 0;
+          return;
+        }
+        touchScrollLastY = e.touches[0].clientY;
+        touchScrollRemainderPx = 0;
+      };
+      const handleTouchMove = (e: TouchEvent) => {
+        if (e.touches.length !== 1 || touchScrollLastY === null) return;
+
+        const currentY = e.touches[0].clientY;
+        const deltaY = touchScrollLastY - currentY;
+        touchScrollLastY = currentY;
+        touchScrollRemainderPx += deltaY;
+
+        const rowHeightPx =
+          (xtermRef.current?.clientHeight || 0) / (terminal.rows || 1) || 0;
+        if (rowHeightPx > 0) {
+          const lineDelta = Math.trunc(touchScrollRemainderPx / rowHeightPx);
+          if (lineDelta !== 0) {
+            terminal.scrollLines(lineDelta);
+            touchScrollRemainderPx -= lineDelta * rowHeightPx;
+          }
+        }
+
+        // We're driving the scroll ourselves via scrollLines(); prevent the
+        // browser from also attempting (and failing) to scroll natively or
+        // triggering pull-to-refresh/rubber-banding for this gesture.
+        e.preventDefault();
+      };
+      const handleTouchEnd = () => {
+        touchScrollLastY = null;
+        touchScrollRemainderPx = 0;
+      };
+      touchScrollTarget?.addEventListener("touchstart", handleTouchStart, {
+        passive: true,
+      });
+      touchScrollTarget?.addEventListener("touchmove", handleTouchMove, {
+        passive: false,
+      });
+      touchScrollTarget?.addEventListener("touchend", handleTouchEnd, {
+        passive: true,
+      });
+      touchScrollTarget?.addEventListener("touchcancel", handleTouchEnd, {
+        passive: true,
+      });
+
       const element = xtermRef.current;
       const handleContextMenu = (e: MouseEvent) => {
         if (e.ctrlKey && onOpenFileManager) {
@@ -2316,6 +2388,10 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
         element?.removeEventListener("mouseup", handleTmuxDragEnd);
         element?.removeEventListener("keydown", handleBackspaceMode, true);
         element?.removeEventListener("keydown", handleTabCapture, true);
+        touchScrollTarget?.removeEventListener("touchstart", handleTouchStart);
+        touchScrollTarget?.removeEventListener("touchmove", handleTouchMove);
+        touchScrollTarget?.removeEventListener("touchend", handleTouchEnd);
+        touchScrollTarget?.removeEventListener("touchcancel", handleTouchEnd);
         if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
         if (resizeTimeout.current) clearTimeout(resizeTimeout.current);
       };
